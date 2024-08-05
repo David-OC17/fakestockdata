@@ -1,8 +1,10 @@
 from glob import glob
 import os
+import numpy as np
 import requests
 import sys
 import zipfile
+import sqlite3
 import pandas as pd
 
 # https://quantquote.com/historical-stock-data  Free Data tab
@@ -36,9 +38,8 @@ def load_file(fn):
                      names=columns).drop('time', axis=1)
 
 
-import numpy as np
 def generate_day(date, open, high, low, close, volume,
-                 freq=pd.Timedelta(seconds=60)):
+                 freq=pd.Timedelta(seconds=1)):
     time = pd.date_range(date + pd.Timedelta(hours=9),
                          date + pd.Timedelta(hours=5 + 12),
                          freq=freq / 5, name='timestamp')
@@ -61,16 +62,18 @@ def generate_day(date, open, high, low, close, volume,
             np.allclose(values.min(), low)):     # are the same as open close
             break                                # this is pretty rare though
 
-    s = pd.Series(values.round(3), index=time)
+    s = pd.Series(values.round(8), index=time)
     rs = s.resample(freq)
-    # TODO: add in volume
-    return pd.DataFrame({'open': rs.first(),
-                         'close': rs.last(),
-                         'high': rs.max(),
-                         'low': rs.min()})
+    volume_distribution = np.random.dirichlet(np.ones(n), size=1).flatten()
+    volumes = (volume_distribution * volume).round(8)
+    volume_series = pd.Series(volumes, index=time).resample(freq).sum()
+
+    return pd.DataFrame({'bid': rs.max(),
+                         'ask': rs.min(),
+                         'volume': volume_series},)
 
 
-def generate_stock(fn, directory=None, freq=pd.Timedelta(seconds=60),
+def generate_stock_csv(fn, directory=None, freq=pd.Timedelta(seconds=1),
                    start=pd.Timestamp('2000-01-01'),
                    end=pd.Timestamp('2050-01-01')):
     start = pd.Timestamp(start)
@@ -91,7 +94,66 @@ def generate_stock(fn, directory=None, freq=pd.Timedelta(seconds=60),
     print('Finished %s' % sym)
 
 
-def generate_stocks(freq=pd.Timedelta(seconds=60), directory=None,
+def create_table_if_not_exists(conn, symbol, dropDates=False):
+    query = ""
+    if dropDates:
+        query = f"""
+        CREATE TABLE IF NOT EXISTS {symbol} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bid REAL,
+            ask REAL,
+            volume REAL
+        )
+        """
+    else:
+        query = f"""
+        CREATE TABLE IF NOT EXISTS {symbol} (
+            timestamp TEXT PRIMARY KEY,
+            bid REAL,
+            ask REAL,
+            volume REAL
+        )
+        """
+    
+    conn.execute(query)
+    conn.commit()
+
+
+def insert_data(conn, symbol, df, dropDates=False):
+    if dropDates:
+        df.to_sql(symbol, conn, if_exists='append', index=False)
+    else:
+        df.to_sql(symbol, conn, if_exists='append', index=True, index_label='timestamp')
+
+
+def generate_stock_sql(fn, db_path='stocks_data.db', freq=pd.Timedelta(seconds=1),
+                   start=pd.Timestamp('2000-01-01'),
+                   end=pd.Timestamp('2050-01-01'),
+                   dropDates=False):
+    start = pd.Timestamp(start)
+    fn2 = os.path.split(fn)[1]
+    sym = fn2[len('table_'):fn2.find('.csv')]
+
+    conn = sqlite3.connect(db_path)
+
+    create_table_if_not_exists(conn, sym, dropDates)
+
+    df = load_file(fn)
+    
+    for date, rec in df.to_dict(orient='index').items():
+        if start <= pd.Timestamp(date) <= end:
+            if dropDates:
+                df2 = generate_day(date, freq=freq, **rec).reset_index().drop('timestamp', axis=1)
+                insert_data(conn, sym, df2, dropDates=True)
+            else:
+                df2 = generate_day(date, freq=freq, **rec)
+                insert_data(conn, sym, df2)
+
+    conn.close()
+    print(f'Finished processing {sym}')
+
+
+def generate_stocks_csv(freq=pd.Timedelta(seconds=1), directory=None,
                     start=pd.Timestamp('2000-01-01')):
     from concurrent.futures import ProcessPoolExecutor, wait
     e = ProcessPoolExecutor()
@@ -101,7 +163,22 @@ def generate_stocks(freq=pd.Timedelta(seconds=60), directory=None,
         glob_path = os.path.join(daily_dir, '*')
     filenames = sorted(glob(glob_path))
 
-    futures = [e.submit(generate_stock, fn, directory=directory, freq=freq,
+    futures = [e.submit(generate_stock_csv, fn, directory=directory, freq=freq,
                         start=start)
                 for fn in filenames]
     wait(futures)
+
+
+def generate_stocks_sql(freq=pd.Timedelta(seconds=1),
+                    start=pd.Timestamp('2000-01-01'),
+                    db_path='stocks_data.db',
+                    dropDates=False):
+    if os.path.exists(os.path.join('data', 'daily')):
+        glob_path = os.path.join('data', 'daily', '*')
+    else:
+        glob_path = os.path.join(daily_dir, '*')
+    filenames = sorted(glob(glob_path))
+
+    for file in filenames:
+        generate_stock_sql(fn=file, db_path=db_path, freq=freq, start=start, dropDates=dropDates)
+        print(f'Added {file} to the database.')
